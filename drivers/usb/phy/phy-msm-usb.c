@@ -46,6 +46,10 @@
 #include <linux/usb/msm_hsusb_hw.h>
 #include <linux/regulator/consumer.h>
 
+#ifdef CONFIG_FORCE_FAST_CHARGE
+#include <linux/fastchg.h>
+#endif
+
 #define MSM_USB_BASE	(motg->regs)
 #define DRIVER_NAME	"msm_otg"
 
@@ -683,7 +687,117 @@ static int msm_otg_set_power(struct usb_phy *phy, unsigned mA)
 	return 0;
 }
 
-static void msm_otg_start_host(struct usb_phy *phy, int on)
+static int msm_otg_notify_power_supply(struct msm_otg *motg, unsigned mA)
+{
+	if (!psy) {
+		dev_dbg(motg->phy.dev, "no usb power supply registered\n");
+		goto psy_error;
+	}
+
+	if (motg->cur_power == 0 && mA > 2) {
+		/* Enable charging */
+		if (power_supply_set_online(psy, true))
+			goto psy_error;
+		if (power_supply_set_current_limit(psy, 1000*mA))
+			goto psy_error;
+	} else if (motg->cur_power >= 0 && (mA == 0 || mA == 2)) {
+		/* Disable charging */
+		if (power_supply_set_online(psy, false))
+			goto psy_error;
+		/* Set max current limit in uA */
+		if (power_supply_set_current_limit(psy, 1000*mA))
+			goto psy_error;
+	} else {
+		if (power_supply_set_online(psy, true))
+			goto psy_error;
+		/* Current has changed (100/2 --> 500) */
+		if (power_supply_set_current_limit(psy, 1000*mA))
+			goto psy_error;
+	}
+
+	power_supply_changed(psy);
+	return 0;
+
+psy_error:
+	dev_dbg(motg->phy.dev, "power supply error when setting property\n");
+	return -ENXIO;
+}
+
+static void msm_otg_set_online_status(struct msm_otg *motg)
+{
+	if (!psy) {
+		dev_dbg(motg->phy.dev, "no usb power supply registered\n");
+		return;
+	}
+
+	/* Set power supply online status to false */
+	if (power_supply_set_online(psy, false))
+		dev_dbg(motg->phy.dev, "error setting power supply property\n");
+}
+
+static void msm_otg_notify_charger(struct msm_otg *motg, unsigned mA)
+{
+	struct usb_gadget *g = motg->phy.otg->gadget;
+	struct msm_otg_platform_data *pdata = motg->pdata;
+
+	if (g && g->is_a_peripheral)
+		return;
+
+	dev_dbg(motg->phy.dev, "Requested curr from USB = %u, max-type-c:%u\n",
+					mA, motg->typec_current_max);
+	/* Save bc1.2 max_curr if type-c charger later moves to diff mode */
+	motg->bc1p2_current_max = mA;
+
+	/*
+	 * Limit type-c charger current to 500 for SDP charger to avoid more
+	 * current drawn than 500 with Hosts that don't support type C due to
+	 * non compliant type-c to standard A cables.
+	 */
+	if (pdata->enable_sdp_typec_current_limit &&
+			(motg->chg_type == USB_SDP_CHARGER) &&
+					motg->typec_current_max > 500)
+		motg->typec_current_max = 500;
+
+	/* Override mA if type-c charger used (use hvdcp/bc1.2 if it is 500) */
+	if (motg->typec_current_max > 500 && mA < motg->typec_current_max)
+		mA = motg->typec_current_max;
+
+	if (msm_otg_notify_chg_type(motg))
+		dev_err(motg->phy.dev,
+			"Failed notifying %d charger type to PMIC\n",
+							motg->chg_type);
+
+	/*
+	 * This condition will be true when usb cable is disconnected
+	 * during bootup before enumeration. Check charger type also
+	 * to avoid clearing online flag in case of valid charger.
+	 */
+	if (motg->online && motg->cur_power == 0 && mA == 0 &&
+			(motg->chg_type == USB_INVALID_CHARGER))
+		msm_otg_set_online_status(motg);
+
+	if (motg->cur_power == mA)
+		return;
+
+#ifdef CONFIG_FORCE_FAST_CHARGE
+        if (force_fast_charge > 0 && mA > 0) {
+            mA = IDEV_CHG_MAX;
+            pr_info("USB fast charging is ON\n");
+        } else {
+            pr_info("USB fast charging is OFF\n");
+        }
+#endif
+
+	dev_info(motg->phy.dev, "Avail curr from USB = %u\n", mA);
+	msm_otg_dbg_log_event(&motg->phy, "AVAIL CURR FROM USB",
+			mA, motg->chg_type);
+
+	msm_otg_notify_power_supply(motg, mA);
+
+	motg->cur_power = mA;
+}
+
+static int msm_otg_set_power(struct usb_phy *phy, unsigned mA)
 {
 	struct msm_otg *motg = container_of(phy, struct msm_otg, phy);
 	struct msm_otg_platform_data *pdata = motg->pdata;
