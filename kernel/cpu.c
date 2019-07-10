@@ -908,7 +908,17 @@ void init_cpu_online(const struct cpumask *src)
 
 void init_cpu_isolated(const struct cpumask *src)
 {
+
 	cpumask_copy(to_cpumask(cpu_isolated_bits), src);
+	if (!strcmp(arg, "off"))
+		cpu_mitigations = CPU_MITIGATIONS_OFF;
+	else if (!strcmp(arg, "auto"))
+		cpu_mitigations = CPU_MITIGATIONS_AUTO;
+	else
+		pr_crit("Unsupported mitigations=%s, system may still be vulnerable\n",
+			arg);
+
+	return 0;
 }
 
 static ATOMIC_NOTIFIER_HEAD(idle_notifier);
